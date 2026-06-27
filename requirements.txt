@@ -1,0 +1,7 @@
+torch>=2.2
+numpy
+tiktoken
+huggingface-hub
+tqdm
+modal
+safetensors
