@@ -13,7 +13,7 @@ DATA_DIR = "/data/fineweb_edu"
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch==2.4.0", "numpy", "huggingface-hub", "tqdm", "tiktoken", "safetensors")
+    .pip_install("torch==2.12.0", "numpy", "huggingface-hub", "tqdm", "tiktoken", "safetensors")
     .add_local_dir(".", "/root/looplm")
 )
 
@@ -65,7 +65,7 @@ def smoke():
     pc = count_params(model)
     print(f"135M (shrunken probe): {pc['total']/1e6:.1f}M params", flush=True)
     muon, adamw, _ = build_optimizers(model, TrainConfig())
-    cmodel = torch.compile(model)
+    cmodel = model
     x = torch.randint(0, cfg.vocab_size, (4, 256), device=dev)
     y = torch.randint(0, cfg.vocab_size, (4, 256), device=dev)
     T_per_seq = torch.full((4,), cfg.mu_rec, device=dev, dtype=torch.long)
