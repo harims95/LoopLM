@@ -39,7 +39,13 @@ class TransformerBlock(nn.Module):
 
 
 class ParcaeLoopBlock(nn.Module):
-    """One iteration of the recurrent unit. Called T times by ParcaeTransformer."""
+    """One iteration of the recurrent unit. Called T times by ParcaeTransformer.
+
+    Architecture (matches official sandyresearch/parcae reference):
+        y     = decay * h + input_gain * (e @ B.T)    # LTI injection step
+        h_new = block(y)                              # transformer with internal residual
+    where decay = exp(-dt * A), A = exp(log_A) ≥ 0, B initialized as identity.
+    """
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
@@ -49,31 +55,36 @@ class ParcaeLoopBlock(nn.Module):
         self.ffn = DenseFFN(cfg)
         d = cfg.d_model
         if cfg.use_a_matrix:
-            # SSM-style stability params: A = -exp(log_A) (diagonal), Δ = softplus(dt_raw), B (dense)
-            self.log_A = nn.Parameter(torch.empty(d))
-            self.dt_raw = nn.Parameter(torch.zeros(d))  # softplus(0) ≈ 0.69
-            self.B = nn.Linear(d, d, bias=False)
+            # Stability params: A = exp(A_log) positive, decay = exp(-dt*A) ∈ (0,1)
+            self.A_log = nn.Parameter(torch.empty(d))
+            self.dt_bias = nn.Parameter(torch.zeros(d))     # softplus(0) ≈ 0.69
+            # B initialized as IDENTITY so e @ B.T = e from step 1 (full input signal)
+            self.B = nn.Parameter(torch.eye(d))
             with torch.no_grad():
-                # init A_bar in roughly (0.5, 0.93) at start
-                self.log_A.uniform_(math.log(0.1), math.log(1.0))
+                # A_log init: A ∈ (0.1, 1.0) so decay = exp(-0.69*A) ∈ (0.5, 0.93)
+                self.A_log.uniform_(math.log(0.1), math.log(1.0))
+
+    def _lti_step(self, h: Tensor, e: Tensor) -> Tensor:
+        """y = decay * h + input_gain * (e @ B.T)"""
+        dt = F.softplus(self.dt_bias)                       # (d,) positive
+        A = torch.exp(self.A_log)                            # (d,) positive
+        decay = torch.exp(-dt * A)                           # (d,) ∈ (0,1)
+        # Euler input gain (paper's choice; ZOH-exact is +0.015 improvement, not worth complexity)
+        input_gain = dt                                      # (d,)
+        input_write = F.linear(e, self.B)                    # e @ B.T, shape (B, S, d)
+        return decay * h + input_gain * input_write
 
     def forward(self, h: Tensor, e: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        # nonlinear delta: transformer block on (h + e), residual carry stripped
-        x = h + e
-        a = self.attn(self.attn_norm(x), cos, sin)
-        x = x + a
-        f = self.ffn(self.ffn_norm(x))
-        delta = a + f
-
+        # Step 1: LTI injection (or naive add if ablated)
         if self.cfg.use_a_matrix:
-            dt = F.softplus(self.dt_raw)            # (d,) positive
-            A = -torch.exp(self.log_A)              # (d,) negative
-            A_bar = torch.exp(dt * A)               # (d,) in (0, 1) → stable
-            B_bar = dt.unsqueeze(-1) * self.B.weight  # (d, d)
-            return A_bar * h + F.linear(e, B_bar) + delta
+            y = self._lti_step(h, e)
         else:
-            # naive looped: h_{t+1} = h_t + delta (no stability guarantee — for ablation)
-            return h + delta
+            y = h + e                                        # naive looped baseline
+
+        # Step 2: standard pre-norm transformer block with internal residual
+        y = y + self.attn(self.attn_norm(y), cos, sin)
+        y = y + self.ffn(self.ffn_norm(y))
+        return y
 
 
 class ParcaeTransformer(nn.Module):
