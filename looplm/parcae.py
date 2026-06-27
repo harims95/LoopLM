@@ -56,13 +56,17 @@ class ParcaeLoopBlock(nn.Module):
         d = cfg.d_model
         if cfg.use_a_matrix:
             # Stability params: A = exp(A_log) positive, decay = exp(-dt*A) ∈ (0,1)
-            self.A_log = nn.Parameter(torch.empty(d))
-            self.dt_bias = nn.Parameter(torch.zeros(d))     # softplus(0) ≈ 0.69
-            # B initialized as IDENTITY so e @ B.T = e from step 1 (full input signal)
+            # Official Parcae init: A=1 everywhere, dt targets decay = sqrt(1/5) ≈ 0.447
+            self.A_log = nn.Parameter(torch.zeros(d))                # A = exp(0) = 1
+            # Want decay = exp(-dt * A) = sqrt(1/5)
+            # → dt = -log(sqrt(1/5)) = 0.5 * log(5) ≈ 0.805
+            # → dt_bias = inv_softplus(0.805) = log(exp(0.805) - 1) ≈ 0.42
+            target_decay = math.sqrt(1.0 / 5.0)
+            target_dt = -math.log(target_decay)
+            dt_bias_init = math.log(math.expm1(target_dt))           # inv_softplus
+            self.dt_bias = nn.Parameter(torch.full((d,), dt_bias_init))
+            # B initialized as IDENTITY so e @ B.T = e from step 1
             self.B = nn.Parameter(torch.eye(d))
-            with torch.no_grad():
-                # A_log init: A ∈ (0.1, 1.0) so decay = exp(-0.69*A) ∈ (0.5, 0.93)
-                self.A_log.uniform_(math.log(0.1), math.log(1.0))
 
     def _lti_step(self, h: Tensor, e: Tensor) -> Tensor:
         """y = decay * h + input_gain * (e @ B.T)"""

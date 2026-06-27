@@ -64,18 +64,26 @@ def build_optimizers(model, tc):
     Goes to Muon: 2D weights that are not embeddings/lm_head.
     Goes to AdamW: embeddings, lm_head, all 1D params (norms, log_A, dt_raw, biases).
     """
-    muon_p, adam_p, seen = [], [], set()
+    muon_p, adam_p, adam_no_wd_p, seen = [], [], [], set()
+    # Parcae SSM params: route to AdamW with NO weight decay (Appendix Q)
+    ssm_names = ("log_A", "A_log", "dt_bias", "loop.B")
     for name, p in model.named_parameters():
         if not p.requires_grad or id(p) in seen:
             continue
         seen.add(id(p))
+        is_ssm = any(s in name for s in ssm_names)
         is_embed = ("embed" in name) or ("lm_head" in name)
-        if p.ndim >= 2 and not is_embed:
+        if is_ssm:
+            adam_no_wd_p.append(p)
+        elif p.ndim >= 2 and not is_embed:
             muon_p.append(p)
         else:
             adam_p.append(p)
     muon = Muon(muon_p, lr=tc.muon_lr, momentum=tc.muon_momentum,
                 weight_decay=tc.muon_wd, ns_steps=tc.muon_ns_steps)
-    adamw = torch.optim.AdamW(adam_p, lr=tc.adam_lr, betas=tc.adam_betas,
-                              weight_decay=tc.adam_wd, eps=1e-8)
-    return muon, adamw, (len(muon_p), len(adam_p))
+    adam_groups = [
+        {"params": adam_p, "weight_decay": tc.adam_wd},
+        {"params": adam_no_wd_p, "weight_decay": 0.0},
+    ]
+    adamw = torch.optim.AdamW(adam_groups, lr=tc.adam_lr, betas=tc.adam_betas, eps=1e-8)
+    return muon, adamw, (len(muon_p), len(adam_p) + len(adam_no_wd_p))
