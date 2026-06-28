@@ -9,11 +9,15 @@ Ablation switches: --set use_a_matrix=false use_input_norm=false mu_rec=4
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 import math
 import os
+import socket
+import subprocess
 import time
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -25,9 +29,36 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import sys as _sys
 _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from looplm.config import TrainConfig, get_config
-from looplm.data import data_generator, CUDAPrefetcher
+from looplm.data import CUDAPrefetcher, data_generator, resolve_shards
 from looplm.parcae import ParcaeTransformer, count_params
 from looplm.optim import build_optimizers
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            cwd="/root/looplm",
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def resolve_data_split(data_dir: str, train_pattern: str, val_pattern: str,
+                       holdout_last_for_val: bool) -> tuple[list[str], list[str] | None]:
+    train_shards = resolve_shards(Path(data_dir) / train_pattern)
+    if holdout_last_for_val:
+        if len(train_shards) < 2:
+            raise ValueError("need at least 2 shards to hold out the last shard for validation")
+        return train_shards[:-1], [train_shards[-1]]
+
+    if not val_pattern:
+        return train_shards, None
+
+    val_shards = resolve_shards(Path(data_dir) / val_pattern)
+    return train_shards, val_shards
 
 
 def lr_mult(step: int, tc: TrainConfig) -> float:
@@ -73,8 +104,9 @@ def main():
     ap.add_argument("--micro_batch_seqs", type=int, default=16)
     ap.add_argument("--val_every", type=int, default=250)
     ap.add_argument("--out_dir", default="runs")
-    ap.add_argument("--save_every", type=int, default=0)
+    ap.add_argument("--save_every", type=int, default=2500)
     ap.add_argument("--no_compile", action="store_true")
+    ap.add_argument("--holdout_last_for_val", action="store_true")
     ap.add_argument("--set", nargs="*", default=[], help="model config overrides key=value")
     args = ap.parse_args()
 
@@ -92,10 +124,6 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     master = rank == 0
 
-    def log(*a):
-        if master:
-            print(*a, flush=True)
-
     tc = TrainConfig(seq_len=args.seq_len, batch_tokens=args.batch_tokens,
                      micro_batch_seqs=args.micro_batch_seqs, max_steps=args.max_steps,
                      val_every=args.val_every, run_name=args.run_name,
@@ -107,6 +135,36 @@ def main():
     cfg = get_config(args.preset)
     for k, v in parse_overrides(args.set).items():
         setattr(cfg, k, v)
+
+    out_dir = Path(tc.out_dir) / tc.run_name
+    log_fp = None
+    if master:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        log_fp = open(out_dir / "train.log", "a", encoding="utf-8", buffering=1)
+
+    def log(*a):
+        if not master:
+            return
+        msg = " ".join(str(x) for x in a)
+        print(msg, flush=True)
+        if log_fp is not None:
+            log_fp.write(msg + "\n")
+
+    if master:
+        gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        spec = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_name": args.run_name,
+            "git_commit": _git_commit(),
+            "cli_args": vars(args),
+            "train_config": asdict(tc),
+            "model_config": asdict(cfg),
+            "hostname": socket.gethostname(),
+            "gpu_count": gpu_count,
+            "gpu_type": torch.cuda.get_device_name(0) if gpu_count else None,
+            "pytorch_version": torch.__version__,
+        }
+        (out_dir / "spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
 
     model = ParcaeTransformer(cfg).to(device)
     amp = (torch.autocast("cuda", dtype=torch.bfloat16)
@@ -130,16 +188,18 @@ def main():
     B, S = tc.micro_batch_seqs, tc.seq_len
     tokens_per_micro = B * S * world
     accum = max(1, tc.batch_tokens // tokens_per_micro)
-    train_gen = data_generator(str(Path(args.data_dir) / args.train_pattern),
-                               B, S, device, rank, world, to_device=False)
+    train_shards, val_shards = resolve_data_split(
+        args.data_dir, args.train_pattern, args.val_pattern, args.holdout_last_for_val
+    )
+    train_gen = data_generator(train_shards, B, S, device, rank, world, to_device=False)
     train_prefetch = CUDAPrefetcher(train_gen, device) if device.type == "cuda" else None
-    val_pattern = str(Path(args.data_dir) / args.val_pattern)
     log(f"batch_tokens={tc.batch_tokens} micro=({B}x{S})x{world} accum={accum} "
         f"muon_lr={tc.muon_lr:.4f} adam_lr={tc.adam_lr:.2e}")
+    log(f"data shards: train={len(train_shards)} val={0 if val_shards is None else len(val_shards)}")
+    if val_shards is None:
+        log("validation disabled: no validation shards matched")
 
-    out_dir = Path(tc.out_dir) / tc.run_name
     if master:
-        out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "config.json").write_text(json.dumps({**cfg.to_dict(), "preset": args.preset}, indent=2))
 
     def save_ckpt(fname, **extra):
@@ -164,8 +224,10 @@ def main():
 
     @torch.no_grad()
     def evaluate(max_tokens=tc.val_tokens):
+        if val_shards is None:
+            return None
         model.eval()
-        gen = data_generator(val_pattern, B, S, device, rank, world)
+        gen = data_generator(val_shards, B, S, device, rank, world)
         tot_loss, tot_tok, steps = 0.0, 0, max(1, max_tokens // (B * S * world))
         for _ in range(steps):
             x, y = next(gen)
@@ -210,17 +272,22 @@ def main():
         if step % tc.log_every == 0:
             dt = (time.time() - t0) / (step + 1)
             log(f"step {step:5d} | loss {loss_accum.item():.4f} | lr {tc.muon_lr*m:.4f} | {dt*1000:.0f}ms/step")
-        if tc.val_every and (step + 1) % tc.val_every == 0:
+        if val_shards is not None and tc.val_every and (step + 1) % tc.val_every == 0:
             vl = evaluate()
             log(f"  >> val loss {vl:.4f} @ step {step+1}")
         if args.save_every and (step + 1) % args.save_every == 0:
             save_ckpt(f"ckpt_{step+1}.pt", step=step + 1)
 
     vl = evaluate()
-    log(f"=== final val loss {vl:.4f} ===")
+    if vl is None:
+        log("=== final val loss skipped (no validation shards) ===")
+    else:
+        log(f"=== final val loss {vl:.4f} ===")
     if master:
         (out_dir / "result.json").write_text(json.dumps({"final_val_loss": vl, "steps": tc.max_steps}))
     save_ckpt("model.pt", step=tc.max_steps, val_loss=vl)
+    if log_fp is not None:
+        log_fp.close()
     if ddp:
         dist.destroy_process_group()
 
