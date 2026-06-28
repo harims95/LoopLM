@@ -1,4 +1,4 @@
-"""FineWeb-Edu data loader. Reads uint16 .bin shards of GPT-2 tokens.
+"""FineWeb-style data loader. Reads uint16 .bin shards of GPT-2 tokens.
 
 Format matches Karpathy's llm.c: each .bin is a flat uint16 array. Shards are
 sharded across DDP ranks; each rank streams its own non-overlapping slice.
@@ -8,6 +8,9 @@ Adapted from rootxhacker/HobbyLM (Apache-2.0).
 from __future__ import annotations
 
 import glob
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
 import torch
 
@@ -23,18 +26,27 @@ def _load_shard(path: str) -> np.ndarray:
     return arr
 
 
-def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: int = 1,
-                   to_device: bool = True):
+def resolve_shards(pattern_or_shards: str | Path | Sequence[str | Path]) -> list[str]:
+    if isinstance(pattern_or_shards, (str, Path)):
+        shards = sorted(glob.glob(str(pattern_or_shards)))
+    else:
+        shards = [str(path) for path in pattern_or_shards]
+    if not shards:
+        raise FileNotFoundError(f"no shards matched: {pattern_or_shards}")
+    return shards
+
+
+def data_generator(pattern_or_shards: str | Path | Sequence[str | Path], B: int, S: int, device,
+                   rank: int = 0, world: int = 1, to_device: bool = True):
     """Infinite generator of (x, y) batches.
 
-    pattern: glob like "/data/fineweb_edu/edu_fineweb_train_*.bin"
+    pattern_or_shards: glob like "/data/fineweb_edu/edu_fineweb_train_*.bin"
+      or an explicit ordered shard list.
     B: micro batch size (sequences)
     S: sequence length (tokens)
-    rank/world: DDP sharding — each rank gets non-overlapping slices.
+    rank/world: DDP sharding; each rank gets non-overlapping slices.
     """
-    shards = sorted(glob.glob(pattern))
-    if not shards:
-        raise FileNotFoundError(f"no shards matched: {pattern}")
+    shards = resolve_shards(pattern_or_shards)
     tokens_per_batch = B * S
     shard_idx = 0
     pos = rank * tokens_per_batch  # stagger ranks
@@ -56,6 +68,7 @@ def data_generator(pattern: str, B: int, S: int, device, rank: int = 0, world: i
 
 class CUDAPrefetcher:
     """Overlap H2D copy with compute. Holds one batch ahead on the GPU stream."""
+
     def __init__(self, gen, device):
         self.gen = gen
         self.device = device

@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large training artifacts (uploaded to HuggingFace, not git)
+artifacts/
+*.pt
+*.safetensors
+*.bin
+
+# Virtual env
+.venv/
+__pycache__/
+*.pyc
